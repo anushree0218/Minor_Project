@@ -1,120 +1,249 @@
 import cv2
 import numpy as np
+from typing import Dict, List, Tuple
 
 class LaneDetector:
-    def __init__(self, config=None):
-        """
-        Initialize lane detector
-        
-        Args:
-            config: Configuration dictionary with parameters
-        """
+    """Lane detection and analysis"""
+    
+    def __init__(self, config: Dict = None):
+        """Initialize lane detector with configuration"""
         self.config = config or {}
         
-        # Default parameters
+        # Parameters for lane detection
         self.canny_low = self.config.get('canny_low', 50)
         self.canny_high = self.config.get('canny_high', 150)
+        self.roi_vertices = self.config.get('roi_vertices', None)
         self.hough_rho = self.config.get('hough_rho', 1)
         self.hough_theta = self.config.get('hough_theta', np.pi/180)
         self.hough_threshold = self.config.get('hough_threshold', 20)
         self.hough_min_line_length = self.config.get('hough_min_line_length', 20)
         self.hough_max_line_gap = self.config.get('hough_max_line_gap', 300)
-        
-        # Confidence calculation parameters
-        self.min_lane_points = self.config.get('min_lane_points', 5)
-        self.max_lane_points = self.config.get('max_lane_points', 50)
-        
-    def detect(self, image):
+    
+    def detect_lanes(self, frame: np.ndarray) -> Dict:
         """
-        Detect lane markings in image
+        Detect lanes in the frame
         
         Args:
-            image: RGB image as numpy array
+            frame: Input image
             
         Returns:
-            lanes: Dictionary with lane information
-                  {'left': [(x1,y1,x2,y2),...], 'right': [(x1,y1,x2,y2),...],
-                   'confidence': {'left': 0.8, 'right': 0.9}}
+            Dict with lane information
         """
         # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Define region of interest (lower part of image)
-        height, width = gray.shape
-        roi_vertices = np.array([
-            [0, height],
-            [0, height * 0.6],
-            [width, height * 0.6],
-            [width, height]
-        ], dtype=np.int32)
+        # Apply Gaussian blur
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Create ROI mask
-        mask = np.zeros_like(gray)
-        cv2.fillPoly(mask, [roi_vertices], 255)
-        masked_gray = cv2.bitwise_and(gray, mask)
+        # Apply Canny edge detection
+        edges = cv2.Canny(blur, self.canny_low, self.canny_high)
         
-        # Apply edge detection
-        edges = cv2.Canny(masked_gray, self.canny_low, self.canny_high)
+        # Define region of interest if not provided
+        if self.roi_vertices is None:
+            height, width = frame.shape[:2]
+            self.roi_vertices = np.array([
+                [(0, height), (width/2, height/2), (width, height)]
+            ], dtype=np.int32)
         
-        # Detect lines using Hough transform
-        lines = cv2.HoughLinesP(edges, self.hough_rho, self.hough_theta, 
-                               self.hough_threshold, None, 
-                               self.hough_min_line_length, self.hough_max_line_gap)
+        # Apply region of interest mask
+        mask = np.zeros_like(edges)
+        cv2.fillPoly(mask, self.roi_vertices, 255)
+        masked_edges = cv2.bitwise_and(edges, mask)
+        
+        # Apply Hough transform to detect lines
+        lines = cv2.HoughLinesP(
+            masked_edges, 
+            self.hough_rho, 
+            self.hough_theta, 
+            self.hough_threshold, 
+            minLineLength=self.hough_min_line_length, 
+            maxLineGap=self.hough_max_line_gap
+        )
         
         # Process detected lines
-        left_lines = []
-        right_lines = []
-        left_confidence = 0.0
-        right_confidence = 0.0
+        left_lines, right_lines = self._separate_lines(lines)
         
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                
-                # Skip horizontal lines
-                if abs(y2 - y1) < 5:
-                    continue
-                
-                # Calculate slope
-                slope = (y2 - y1) / (x2 - x1 + 1e-6)  # Avoid division by zero
-                
-                # Filter by slope - negative slope for left lanes, positive for right
-                if slope < -0.35:
-                    left_lines.append([x1, y1, x2, y2])
-                elif slope > 0.35:
-                    right_lines.append([x1, y1, x2, y2])
+        # Fit lane lines
+        left_fit = self._fit_lane(left_lines, frame.shape[:2])
+        right_fit = self._fit_lane(right_lines, frame.shape[:2])
         
-        # Calculate confidence based on number of detected line segments
-        left_confidence = self._calculate_confidence(len(left_lines))
-        right_confidence = self._calculate_confidence(len(right_lines))
+        # Calculate lane curvature and position
+        curvature = self._calculate_curvature(left_fit, right_fit)
+        position = self._calculate_position(left_fit, right_fit, frame.shape[1])
         
-        # Return detected lanes
+        # Calculate confidence in lane detection
+        confidence = self._calculate_confidence(left_lines, right_lines)
+        
         return {
-            'left': left_lines,
-            'right': right_lines,
-            'confidence': {
-                'left': left_confidence,
-                'right': right_confidence
-            }
+            'left_fit': left_fit,
+            'right_fit': right_fit,
+            'curvature': curvature,
+            'position': position,
+            'confidence': confidence
         }
     
-    def _calculate_confidence(self, num_points):
+    def _separate_lines(self, lines):
+        """Separate lines into left and right lanes"""
+        left_lines = []
+        right_lines = []
+        
+        if lines is None:
+            return left_lines, right_lines
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 == x1:
+                continue  # Skip vertical lines
+            
+            slope = (y2 - y1) / (x2 - x1)
+            
+            # Filter based on slope
+            if abs(slope) < 0.5:
+                continue  # Ignore horizontal lines
+            
+            if slope < 0:
+                left_lines.append(line)
+            else:
+                right_lines.append(line)
+        
+        return left_lines, right_lines
+    
+    def _fit_lane(self, lines, img_shape):
+        """Fit a polynomial to the lane lines"""
+        if not lines:
+            return None
+        
+        x_coords = []
+        y_coords = []
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            x_coords.extend([x1, x2])
+            y_coords.extend([y1, y2])
+        
+        if not x_coords or not y_coords:
+            return None
+        
+        # Fit a polynomial
+        return np.polyfit(y_coords, x_coords, 2)
+    
+    def _calculate_curvature(self, left_fit, right_fit):
+        """Calculate lane curvature"""
+        if left_fit is None or right_fit is None:
+            return float('inf')
+        
+        # Average the curvature of both lines
+        left_curvature = abs(left_fit[0])
+        right_curvature = abs(right_fit[0])
+        
+        # Average curvature - higher value = straighter lane
+        avg_curvature = (left_curvature + right_curvature) / 2
+        return avg_curvature
+    
+    def _calculate_position(self, left_fit, right_fit, img_width):
+        """Calculate vehicle position relative to lane center"""
+        if left_fit is None or right_fit is None:
+            return 0
+        
+        # Calculate lane position at the bottom of the image
+        y = img_width  # Using bottom of image
+        left_x = left_fit[0] * y**2 + left_fit[1] * y + left_fit[2]
+        right_x = right_fit[0] * y**2 + right_fit[1] * y + right_fit[2]
+        
+        # Calculate lane center
+        lane_center = (left_x + right_x) / 2
+        
+        # Calculate vehicle position (assuming camera is mounted at center)
+        vehicle_position = img_width / 2
+        
+        # Positive = right of center, negative = left of center
+        position = vehicle_position - lane_center
+        return position
+    
+    def _calculate_confidence(self, left_lines, right_lines):
+        """Calculate confidence in lane detection"""
+        # Higher confidence if we have more lines
+        left_count = len(left_lines) if left_lines else 0
+        right_count = len(right_lines) if right_lines else 0
+        
+        # Basic confidence calculation
+        if left_count == 0 and right_count == 0:
+            return 0.0
+        
+        # More confidence if we have both left and right lines
+        if left_count > 0 and right_count > 0:
+            base_confidence = 0.7
+        else:
+            base_confidence = 0.4
+        
+        # Add confidence based on number of lines (diminishing returns)
+        line_confidence = min(0.3, (left_count + right_count) / 20)
+        
+        return base_confidence + line_confidence
+    
+    def visualize_lanes(self, frame: np.ndarray, lane_info: Dict) -> np.ndarray:
         """
-        Calculate confidence level based on number of detected line segments
+        Visualize detected lanes on the frame
         
         Args:
-            num_points: Number of line segments detected
+            frame: Input image
+            lane_info: Lane information from detect_lanes
             
         Returns:
-            confidence: Value between 0.0 and 1.0
+            Frame with lane visualization
         """
-        if num_points < self.min_lane_points:
-            # Too few points, low confidence
-            return max(0.0, num_points / self.min_lane_points * 0.5)
-        elif num_points > self.max_lane_points:
-            # Many points but could be noise, cap confidence
-            return 0.95
-        else:
-            # Scale confidence between 0.5 and 0.95
-            normalized = (num_points - self.min_lane_points) / (self.max_lane_points - self.min_lane_points)
-            return 0.5 + normalized * 0.45
+        visualization = frame.copy()
+        height, width = frame.shape[:2]
+        
+        # Create an overlay for the lanes
+        overlay = np.zeros_like(frame)
+        
+        # Draw lanes if detected
+        if lane_info['left_fit'] is not None and lane_info['right_fit'] is not None:
+            # Generate points for the lane polygon
+            ploty = np.linspace(0, height-1, num=height)
+            left_fitx = lane_info['left_fit'][0]*ploty**2 + lane_info['left_fit'][1]*ploty + lane_info['left_fit'][2]
+            right_fitx = lane_info['right_fit'][0]*ploty**2 + lane_info['right_fit'][1]*ploty + lane_info['right_fit'][2]
+            
+            # Create points for polygon
+            pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
+            pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
+            pts = np.hstack((pts_left, pts_right))
+            
+            # Draw lane area
+            cv2.fillPoly(overlay, np.int32([pts]), (0, 255, 0))
+            
+            # Draw lane lines
+            for i in range(height-1):
+                if 0 <= left_fitx[i] < width and 0 <= left_fitx[i+1] < width:
+                    cv2.line(overlay, (int(left_fitx[i]), int(ploty[i])), 
+                             (int(left_fitx[i+1]), int(ploty[i+1])), (255, 0, 0), 5)
+                
+                if 0 <= right_fitx[i] < width and 0 <= right_fitx[i+1] < width:
+                    cv2.line(overlay, (int(right_fitx[i]), int(ploty[i])), 
+                             (int(right_fitx[i+1]), int(ploty[i+1])), (0, 0, 255), 5)
+        
+        # Apply the overlay with transparency
+        alpha = 0.4
+        cv2.addWeighted(overlay, alpha, visualization, 1 - alpha, 0, visualization)
+        
+        # Add text information
+        info_text = [
+            f"Lane Curvature: {lane_info['curvature']:.2f}",
+            f"Vehicle Position: {lane_info['position']:.2f}px",
+            f"Detection Confidence: {lane_info['confidence']:.2f}"
+        ]
+        
+        y_offset = 30
+        for i, text in enumerate(info_text):
+            cv2.putText(
+                visualization, 
+                text, 
+                (10, y_offset + i*30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.8, 
+                (255, 255, 255), 
+                2
+            )
+        
+        return visualization

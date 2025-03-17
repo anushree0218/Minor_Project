@@ -1,127 +1,177 @@
 import cv2
-import torch
 import numpy as np
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from torchvision.transforms import functional as F
+from typing import Dict, List, Tuple
+import yaml
 
 class ObjectDetector:
-    def __init__(self, model_path=None, confidence_threshold=0.5):
+    """Object detector with priority-based processing"""
+    
+    def __init__(self, model_path: str, priority_config_path: str):
+        """Initialize detector with model and priority config"""
+        # Load model
+        self.model = self._load_model(model_path)
+        
+        # Load priority configuration
+        with open(priority_config_path, 'r') as f:
+            self.priority_config = yaml.safe_load(f)
+        
+        # Set up class labels
+        self.classes = self.priority_config.get('classes', [])
+        self.class_priorities = self.priority_config.get('priorities', {})
+        
+        # Confidence thresholds
+        self.confidence_threshold = 0.5
+        self.nms_threshold = 0.4
+    
+    def _load_model(self, model_path: str):
+        """Load detection model"""
+        # For this example, using OpenCV's DNN module with a pre-trained model
+        # Real implementation would use a more sophisticated model (YOLO, SSD, etc.)
+        net = cv2.dnn.readNetFromDarknet(
+            f"{model_path}/yolov4-tiny.cfg", 
+            f"{model_path}/yolov4-tiny.weights"
+        )
+        
+        # Set backend and target
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        return net
+    
+    def detect(self, frame: np.ndarray, context: Dict = None) -> List[Dict]:
         """
-        Initialize object detector with YOLO or Faster R-CNN
+        Detect objects in frame with priority-based processing
         
         Args:
-            model_path: Path to pretrained model weights
-            confidence_threshold: Minimum confidence for detections
-        """
-        self.confidence_threshold = confidence_threshold
-        
-        # Load pretrained model or custom model
-        if model_path:
-            # Load custom model
-            self.model = torch.load(model_path)
-        else:
-            # Use pretrained model
-            self.model = fasterrcnn_resnet50_fpn(pretrained=True)
-            
-        self.model.eval()
-        if torch.cuda.is_available():
-            self.model = self.model.cuda()
-            
-        # Object classes of interest for navigation
-        self.navigation_classes = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 
-            4: 'bus', 5: 'truck', 6: 'traffic light', 7: 'stop sign',
-            8: 'parking meter', 9: 'fire hydrant'
-        }
-        
-    def detect(self, image, priority_regions=None):
-        """
-        Detect objects in an image
-        
-        Args:
-            image: RGB image as numpy array
-            priority_regions: Optional mask of regions to prioritize
+            frame: Input image
+            context: Current driving context (intersection, highway, etc.)
             
         Returns:
-            detections: List of dictionaries with detected objects
-                        [{'box': [x1,y1,x2,y2], 'class': class_id, 
-                          'score': confidence, 'priority': priority_level}]
+            List of detections with priority scores
         """
-        # Convert to tensor format
-        img_tensor = F.to_tensor(image).unsqueeze(0)
-        if torch.cuda.is_available():
-            img_tensor = img_tensor.cuda()
-            
-        # Run inference
-        with torch.no_grad():
-            predictions = self.model(img_tensor)
-            
-        # Process detections
-        detections = []
-        for i, pred in enumerate(predictions):
-            boxes = pred['boxes'].cpu().numpy()
-            scores = pred['scores'].cpu().numpy()
-            labels = pred['labels'].cpu().numpy()
-            
-            # Filter by confidence
-            valid_detections = scores >= self.confidence_threshold
-            boxes = boxes[valid_detections]
-            scores = scores[valid_detections]
-            labels = labels[valid_detections]
-            
-            # Create detection objects
-            for box, score, label in zip(boxes, scores, labels):
-                if label in self.navigation_classes:
-                    x1, y1, x2, y2 = map(int, box)
-                    
-                    # Assign priority based on object class and location
-                    priority = self._assign_priority(label, [x1, y1, x2, y2], priority_regions)
-                    
-                    detections.append({
-                        'box': [x1, y1, x2, y2],
-                        'class': int(label),
-                        'class_name': self.navigation_classes.get(int(label), 'unknown'),
-                        'score': float(score),
-                        'priority': priority
-                    })
+        # Prepare input blob
+        blob = cv2.dnn.blobFromImage(
+            frame, 1/255.0, (416, 416), swapRB=True, crop=False
+        )
+        self.model.setInput(blob)
         
+        # Get output layers
+        layer_names = self.model.getLayerNames()
+        output_layers = [layer_names[i - 1] for i in self.model.getUnconnectedOutLayers()]
+        
+        # Forward pass
+        outputs = self.model.forward(output_layers)
+        
+        # Process detections
+        detections = self._process_detections(outputs, frame, context)
         return detections
     
-    def _assign_priority(self, class_id, box, priority_regions=None):
-        """
-        Assign priority to detection based on class and location
+    def _process_detections(self, outputs, frame, context):
+        """Process raw detections into structured results with priorities"""
+        height, width = frame.shape[:2]
+        boxes = []
+        confidences = []
+        class_ids = []
         
-        Args:
-            class_id: Object class ID
-            box: [x1, y1, x2, y2] bounding box
-            priority_regions: Optional priority mask
-            
-        Returns:
-            priority: Priority level (1-10, where 10 is highest)
-        """
-        # Base priorities for different object types
-        high_priority_classes = [6, 7]  # traffic light, stop sign
-        medium_priority_classes = [0, 1, 2, 3, 4, 5]  # vehicles and people
-        low_priority_classes = [8, 9]  # less critical for immediate navigation
-        
-        # Default priority based on class
-        if class_id in high_priority_classes:
-            base_priority = 8
-        elif class_id in medium_priority_classes:
-            base_priority = 5
-        elif class_id in low_priority_classes:
-            base_priority = 3
-        else:
-            base_priority = 2
-            
-        # Adjust by region priority if available
-        if priority_regions is not None:
-            x1, y1, x2, y2 = box
-            box_center_x = (x1 + x2) // 2
-            box_center_y = (y1 + y2) // 2
-            
-            if 0 <= box_center_y < priority_regions.shape[0] and 0 <= box_center_x < priority_regions.shape[1]:
-                region_priority = priority_regions[box_center_y, box_center_x] / 255 * 2  # Scale to 0-2
-                base_priority += region_priority
+        # Process each detection
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
                 
-        return min(10, max(1, base_priority))  # Clamp to range 1-10
+                if confidence > self.confidence_threshold:
+                    # Convert to pixel coordinates
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    
+                    # Calculate top-left corner
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+        
+        # Apply non-maximum suppression
+        indices = cv2.dnn.NMSBoxes(
+            boxes, confidences, self.confidence_threshold, self.nms_threshold
+        )
+        
+        # Calculate priorities based on context
+        detections = []
+        for i in indices:
+            if isinstance(i, list):  # Handle different OpenCV versions
+                i = i[0]
+            
+            box = boxes[i]
+            class_id = class_ids[i]
+            confidence = confidences[i]
+            
+            # Get class name
+            class_name = self.classes[class_id] if class_id < len(self.classes) else f"class_{class_id}"
+            
+            # Calculate priority based on context
+            priority = self._calculate_priority(class_name, context)
+            
+            detections.append({
+                'box': box,
+                'class_id': class_id,
+                'class_name': class_name,
+                'confidence': confidence,
+                'priority': priority
+            })
+        
+        # Sort by priority
+        detections.sort(key=lambda x: x['priority'], reverse=True)
+        return detections
+    
+    def _calculate_priority(self, class_name: str, context: Dict = None) -> float:
+        """Calculate object priority based on context"""
+        # Base priority from config
+        base_priority = self.class_priorities.get(class_name, 0.5)
+        
+        if context is None:
+            return base_priority
+        
+        # Context-based priority adjustment
+        context_type = context.get('type', 'default')
+        
+        # Priority multipliers for different contexts
+        context_multipliers = {
+            'intersection': {
+                'traffic_light': 2.0,
+                'stop_sign': 2.0,
+                'crosswalk': 1.8,
+                'car': 1.5,
+                'person': 1.8
+            },
+            'highway': {
+                'lane_marking': 1.5,
+                'car': 1.3,
+                'truck': 1.5,
+                'road_sign': 1.2
+            },
+            'residential': {
+                'person': 2.0,
+                'bicycle': 1.8,
+                'car': 1.2,
+                'stop_sign': 1.5
+            },
+            'default': {
+                # Default multipliers
+            }
+        }
+        
+        # Get multiplier for this class in this context
+        multiplier = context_multipliers.get(context_type, {}).get(class_name, 1.0)
+        
+        # Apply distance-based priority adjustment if available
+        if 'distances' in context and class_name in context['distances']:
+            distance = context['distances'][class_name]
+            # Closer objects get higher priority, with a non-linear relationship
+            distance_factor = 1.0 / (1.0 + 0.1 * distance)
+            multiplier *= distance_factor
+        
+        return base_priority * multiplier

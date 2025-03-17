@@ -1,10 +1,9 @@
-# src/perception/scene_analyzer.py
 import cv2
 import numpy as np
 from collections import Counter, deque
 
 class SceneAnalyzer:
-    def _init_(self, config=None):
+    def __init__(self, config=None):
         """
         Initialize scene analyzer to classify current driving context
         
